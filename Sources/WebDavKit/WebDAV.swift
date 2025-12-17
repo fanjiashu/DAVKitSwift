@@ -1266,3 +1266,212 @@ public extension WebDAV {
         return path.rangeOfCharacter(from: allowedCharacterSet.inverted) != nil
     }
 }
+
+
+// MARK: - 流式上传扩展
+public extension WebDAV {
+    
+    /// 上传配置结构体
+    struct UploadConfig {
+        /// 分片大小（默认5MB）
+        public var chunkSize: Int64 = 5 * 1024 * 1024
+        /// 是否启用断点续传
+        public var resumeEnabled: Bool = true
+        /// 进度更新间隔（秒）
+        public var progressInterval: TimeInterval = 0.5
+        
+        public static let `default` = UploadConfig()
+    }
+    
+    /// 上传进度信息
+    struct UploadProgress {
+        /// 总字节数
+        public let totalBytes: Int64
+        /// 已上传字节数
+        public let uploadedBytes: Int64
+        /// 进度百分比 (0-100)
+        public let percentage: Double
+        /// 上传速度（字节/秒）
+        public let speed: Double
+        
+        public var description: String {
+            let totalMB = Double(totalBytes) / 1024 / 1024
+            let uploadedMB = Double(uploadedBytes) / 1024 / 1024
+            let speedMB = speed / 1024 / 1024
+            
+            return String(format: "%.1f%% (%.1f/%.1f MB) @ %.1f MB/s",
+                         percentage, uploadedMB, totalMB, speedMB)
+        }
+    }
+    
+    /// 流式上传文件（支持断点续传和进度回调）
+    /// - Parameters:
+    ///   - remotePath: 远程文件路径
+    ///   - localFileURL: 本地文件URL
+    ///   - config: 上传配置（可选）
+    ///   - progressHandler: 进度回调（可选）
+    /// - Returns: 上传是否成功
+    func uploadStream(
+        to remotePath: String,
+        from localFileURL: URL,
+        config: UploadConfig = .default,
+        progressHandler: ((UploadProgress) -> Void)? = nil
+    ) async throws -> Bool {
+        
+        // 验证本地文件
+        guard FileManager.default.fileExists(atPath: localFileURL.path) else {
+            throw NSError(domain: "WebDAV", code: -1,
+                         userInfo: [NSLocalizedDescriptionKey: "文件不存在: \(localFileURL.path)"])
+        }
+        
+        let fileSize = try await getLocalFileSize(localFileURL)
+        print("开始上传: \(localFileURL.lastPathComponent) (\(fileSize / 1024 / 1024) MB)")
+        
+        // 检查已上传的字节数
+        var uploadedBytes: Int64 = 0
+        if config.resumeEnabled {
+            uploadedBytes = try await getUploadedBytes(remotePath)
+            if uploadedBytes == fileSize {
+                print("文件已完全上传")
+                progressHandler?(UploadProgress(totalBytes: fileSize,
+                                                uploadedBytes: fileSize,
+                                                percentage: 100.0,
+                                                speed: 0))
+                return true
+            } else if uploadedBytes > 0 {
+                print("断点续传: 已上传 \(uploadedBytes / 1024 / 1024) MB")
+            }
+        }
+        
+        // 分片上传
+        let startTime = Date()
+        var lastProgressTime = startTime
+        var lastUploadedBytes: Int64 = uploadedBytes
+        
+        let fileHandle = try FileHandle(forReadingFrom: localFileURL)
+        defer { try? fileHandle.close() }
+        
+        if uploadedBytes > 0 {
+            try fileHandle.seek(toOffset: UInt64(uploadedBytes))
+        }
+        
+        while uploadedBytes < fileSize {
+            let chunkSize = min(config.chunkSize, fileSize - uploadedBytes)
+            let chunkData = try fileHandle.read(upToCount: Int(chunkSize)) ?? Data()
+            
+            guard chunkData.count == chunkSize else {
+                throw NSError(domain: "WebDAV", code: -2,
+                             userInfo: [NSLocalizedDescriptionKey: "读取文件失败"])
+            }
+            
+            // 上传分片
+            let success = try await uploadChunk(
+                to: remotePath,
+                data: chunkData,
+                start: uploadedBytes,
+                end: uploadedBytes + chunkSize - 1,
+                total: fileSize
+            )
+            
+            guard success else {
+                throw NSError(domain: "WebDAV", code: -3,
+                             userInfo: [NSLocalizedDescriptionKey: "分片上传失败"])
+            }
+            
+            uploadedBytes += chunkSize
+            
+            // 更新进度
+            let now = Date()
+            if now.timeIntervalSince(lastProgressTime) >= config.progressInterval {
+                let elapsed = now.timeIntervalSince(startTime)
+                let speed = elapsed > 0 ? Double(uploadedBytes - lastUploadedBytes) /
+                              now.timeIntervalSince(lastProgressTime) : 0
+                let percentage = Double(uploadedBytes) / Double(fileSize) * 100.0
+                
+                let progress = UploadProgress(
+                    totalBytes: fileSize,
+                    uploadedBytes: uploadedBytes,
+                    percentage: percentage,
+                    speed: speed
+                )
+                
+                progressHandler?(progress)
+                print("上传进度: \(progress.description)")
+                
+                lastProgressTime = now
+                lastUploadedBytes = uploadedBytes
+            }
+        }
+        
+        let totalTime = Date().timeIntervalSince(startTime)
+        print("上传完成: 总耗时 \(String(format: "%.1f", totalTime)) 秒")
+        
+        return true
+    }
+    
+    /// 简化版上传（只有进度百分比）
+    func uploadStream(
+        to remotePath: String,
+        from localFileURL: URL,
+        progressHandler: ((Double) -> Void)? = nil
+    ) async throws -> Bool {
+        return try await uploadStream(to: remotePath, from: localFileURL) { progress in
+            progressHandler?(progress.percentage)
+        }
+    }
+    
+    // MARK: - 私有辅助函数
+    
+    /// 获取本地文件大小
+    private func getLocalFileSize(_ url: URL) async throws -> Int64 {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        guard let size = attributes[.size] as? Int64 else {
+            throw NSError(domain: "WebDAV", code: -4,
+                         userInfo: [NSLocalizedDescriptionKey: "无法获取文件大小"])
+        }
+        return size
+    }
+    
+    /// 获取已上传的字节数
+    private func getUploadedBytes(_ remotePath: String) async throws -> Int64 {
+        do {
+            return try await fileSize(atPath: remotePath)
+        } catch {
+            // 如果文件不存在或出错，返回0
+            return 0
+        }
+    }
+    
+    /// 上传单个分片
+    private func uploadChunk(
+        to path: String,
+        data: Data,
+        start: Int64,
+        end: Int64,
+        total: Int64
+    ) async throws -> Bool {
+        guard var request = authorizedRequest(path: path, method: .put) else {
+            throw WebDAVError.invalidCredentials
+        }
+        
+        // 设置Content-Range头部
+        request.setValue("bytes \(start)-\(end)/\(total)",
+                        forHTTPHeaderField: "Content-Range")
+        request.setValue("application/octet-stream",
+                        forHTTPHeaderField: "Content-Type")
+        request.httpBody = data
+        
+        do {
+            let (_, response) = try await sendRequest(request)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                return false
+            }
+            
+            // 接受200（OK）、201（Created）、206（Partial Content）和308（Permanent Redirect）
+            return (200...299).contains(httpResponse.statusCode) ||
+                   httpResponse.statusCode == 308
+        } catch {
+            throw error
+        }
+    }
+}
